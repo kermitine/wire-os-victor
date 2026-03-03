@@ -764,9 +764,9 @@ void FaceInfoScreenManager::DrawConfidenceClock(
   drawImg.FillWith( {clearColor.r(), clearColor.g(), clearColor.b()} );
 
   const Point2i center_px = { FACE_DISPLAY_WIDTH / 2, FACE_DISPLAY_HEIGHT / 2 };
-  constexpr int circleRadius_px = 40;
+  int circleRadius_px = IsXray() ? 32 : 40;
   constexpr int innerRadius_px = 5;
-  constexpr int maxBarLen_px = circleRadius_px - innerRadius_px - 4;
+  int maxBarLen_px = circleRadius_px - innerRadius_px - 4;
   constexpr int barWidth_px = 3;
   constexpr float angleFactorA = 0.866f; // cos(30 degrees)
   constexpr float angleFactorB = 0.5f; // sin(30 degrees)
