@@ -24,8 +24,11 @@
 #define LSB(a) ((a) & 0xff)
 
 static int MAX_TRANSFER = 0x1000;
+static const uint32_t LCD_SPI_SPEED_HZ = 10000000;
 
 static int lcd_use_fb; // use /dev/fb0?
+static struct fb_fix_screeninfo lcd_fb_fixed_info;
+static struct fb_var_screeninfo lcd_fb_var_info;
 
 #define GPIO_LCD_WRX   110
 #define GPIO_LCD_RESET_MIDAS 96
@@ -175,12 +178,21 @@ bool lcd_use_midas_crop() {
 static int lcd_spi_init()
 {
   // SPI setup
-  static const uint8_t    MODE = 0;
+  uint8_t mode = SPI_MODE_0;
+  uint8_t bits_per_word = 8;
+  uint32_t speed_hz = LCD_SPI_SPEED_HZ;
   int lcd_fd = open("/dev/spidev1.0", O_RDWR);
   if (lcd_fd < 0) {
     error_return(app_DEVICE_OPEN_ERROR, "Can't open LCD SPI interface: %d\n", errno);
   }
-  ioctl(lcd_fd, SPI_IOC_RD_MODE, &MODE);
+  if (ioctl(lcd_fd, SPI_IOC_WR_MODE, &mode) < 0 ||
+      ioctl(lcd_fd, SPI_IOC_WR_BITS_PER_WORD, &bits_per_word) < 0 ||
+      ioctl(lcd_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed_hz) < 0) {
+    const int saved_errno = errno;
+    close(lcd_fd);
+    errno = saved_errno;
+    error_return(app_IO_ERROR, "Can't configure LCD SPI interface: %d\n", errno);
+  }
 
   // Set MAX_TRANSFER size based on the spidev bufsiz parameter
   int bufsiz_fd = open("/sys/module/spidev/parameters/bufsiz", O_RDONLY);
@@ -194,10 +206,9 @@ static int lcd_spi_init()
   int bytes_read = 0;
 
   // Attempt to read enough bytes to fit in our buffer
-  while(bytes_read < sizeof(buf))
+  while(bytes_read < (int)sizeof(buf) - 1)
   {
-    int num_bytes = read(bufsiz_fd, buf + bytes_read, sizeof(buf) - bytes_read);
-    bytes_read += num_bytes;
+    int num_bytes = read(bufsiz_fd, buf + bytes_read, sizeof(buf) - 1 - bytes_read);
     if(num_bytes == 0)
     {
       // End of file
@@ -208,10 +219,16 @@ static int lcd_spi_init()
       (void)close(bufsiz_fd);
       error_return(app_IO_ERROR, "Failed to read from spi bufsiz: %d\n", errno);
     }
+    bytes_read += num_bytes;
   }
 
   char* end;
   int size = strtol(buf, &end, 10);
+  if (end == buf || size <= 0) {
+    (void)close(bufsiz_fd);
+    close(lcd_fd);
+    error_return(app_VALIDATION_ERROR, "Invalid SPI bufsiz value: '%s'\n", buf);
+  }
   MAX_TRANSFER = size;
 
   (void)close(bufsiz_fd);
@@ -219,19 +236,31 @@ static int lcd_spi_init()
   return lcd_fd;
 }
 
-static void lcd_spi_transfer(int cmd, int bytes, const void* data) {
+static int lcd_spi_transfer(int cmd, int bytes, const void* data) {
   const uint8_t* tx_buf = data;
 
   gpio_set_value(DnC_PIN, cmd ? gpio_LOW : gpio_HIGH);
 
   while (bytes > 0) {
     const size_t count = bytes > MAX_TRANSFER ? MAX_TRANSFER : bytes;
+    const ssize_t bytes_written = write(lcd_fd, tx_buf, count);
+    if (bytes_written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      printf("LCD SPI write failed: %d\n", errno);
+      return -1;
+    }
+    if (bytes_written == 0) {
+      printf("LCD SPI write made no progress\n");
+      return -1;
+    }
 
-    (void)write(lcd_fd, tx_buf, count);
-
-    bytes -= count;
-    tx_buf += count;
+    bytes -= bytes_written;
+    tx_buf += bytes_written;
   }
+
+  return 0;
 }
 
 static void lcd_run_script(const INIT_SCRIPT* script)
@@ -247,8 +276,7 @@ static void lcd_run_script(const INIT_SCRIPT* script)
 /************ LCD Framebuffer device *************/
 static int lcd_fb_init(void)
 {
-  struct fb_fix_screeninfo fixed_info;
-  int _fd = open("/dev/fb0", O_RDWR | O_NONBLOCK);
+  int _fd = open("/dev/fb0", O_RDWR);
   if (_fd < 0)
   {
     // This is expected until we decide to use the framebuffer device
@@ -256,12 +284,96 @@ static int lcd_fb_init(void)
     return -1;
   }
   
-  if (ioctl(_fd, FBIOGET_FSCREENINFO, &fixed_info) < 0)
+  if (ioctl(_fd, FBIOGET_FSCREENINFO, &lcd_fb_fixed_info) < 0 ||
+      ioctl(_fd, FBIOGET_VSCREENINFO, &lcd_fb_var_info) < 0)
   {
-    error_return(app_IO_ERROR, "Get screen info failed: %d\n", errno);
+    printf("Failed to get LCD framebuffer info: %d\n", errno);
+    close(_fd);
+    return -1;
   }
-  
+
+  const uint32_t width = LCD_DISPLAY_MAN == MIDAS ? LCD_FRAME_WIDTH_MIDAS : LCD_FRAME_WIDTH_SANTEK;
+  const uint32_t height = LCD_DISPLAY_MAN == MIDAS ? LCD_FRAME_HEIGHT_MIDAS : LCD_FRAME_HEIGHT_SANTEK;
+  const bool is_rgb565 = lcd_fb_var_info.bits_per_pixel == 16 &&
+                         lcd_fb_var_info.red.offset == 11 && lcd_fb_var_info.red.length == 5 &&
+                         lcd_fb_var_info.green.offset == 5 && lcd_fb_var_info.green.length == 6 &&
+                         lcd_fb_var_info.blue.offset == 0 && lcd_fb_var_info.blue.length == 5 &&
+                         lcd_fb_var_info.red.msb_right == 0 &&
+                         lcd_fb_var_info.green.msb_right == 0 &&
+                         lcd_fb_var_info.blue.msb_right == 0;
+  const uint64_t last_row_end =
+    ((uint64_t)lcd_fb_var_info.yoffset + height - 1) * lcd_fb_fixed_info.line_length +
+    ((uint64_t)lcd_fb_var_info.xoffset + width) * sizeof(uint16_t);
+
+  const bool is_packed_color = lcd_fb_fixed_info.type == FB_TYPE_PACKED_PIXELS &&
+                               (lcd_fb_fixed_info.visual == FB_VISUAL_TRUECOLOR ||
+                                lcd_fb_fixed_info.visual == FB_VISUAL_DIRECTCOLOR);
+
+  if (!is_packed_color || !is_rgb565 ||
+      lcd_fb_var_info.xres != width || lcd_fb_var_info.yres != height ||
+      lcd_fb_var_info.xoffset + width > lcd_fb_var_info.xres_virtual ||
+      lcd_fb_var_info.yoffset + height > lcd_fb_var_info.yres_virtual ||
+      lcd_fb_fixed_info.line_length < (lcd_fb_var_info.xoffset + width) * sizeof(uint16_t) ||
+      last_row_end > lcd_fb_fixed_info.smem_len) {
+    printf("Unsupported LCD framebuffer layout: %ux%u, %ubpp, stride %u\n",
+           lcd_fb_var_info.xres, lcd_fb_var_info.yres,
+           lcd_fb_var_info.bits_per_pixel, lcd_fb_fixed_info.line_length);
+    close(_fd);
+    return -1;
+  }
+
   return _fd;
+}
+
+static int lcd_fb_write_at(off_t offset, const uint8_t* data, size_t size)
+{
+  if (lseek(lcd_fd, offset, SEEK_SET) != offset) {
+    printf("LCD framebuffer seek failed: %d\n", errno);
+    return -1;
+  }
+
+  while (size > 0) {
+    const ssize_t bytes_written = write(lcd_fd, data, size);
+    if (bytes_written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      printf("LCD framebuffer write failed: %d\n", errno);
+      return -1;
+    }
+    if (bytes_written == 0) {
+      printf("LCD framebuffer write made no progress\n");
+      return -1;
+    }
+
+    data += bytes_written;
+    size -= bytes_written;
+  }
+
+  return 0;
+}
+
+static int lcd_fb_draw_frame(const uint16_t* frame, uint32_t width, uint32_t height)
+{
+  const size_t row_bytes = width * sizeof(uint16_t);
+  const uint8_t* row = (const uint8_t*)frame;
+
+  if (lcd_fb_var_info.xoffset == 0 && lcd_fb_fixed_info.line_length == row_bytes) {
+    const off_t offset = (off_t)lcd_fb_var_info.yoffset * lcd_fb_fixed_info.line_length;
+    return lcd_fb_write_at(offset, row, row_bytes * height);
+  }
+
+  for (uint32_t y = 0; y < height; ++y) {
+    const off_t offset =
+      ((off_t)lcd_fb_var_info.yoffset + y) * lcd_fb_fixed_info.line_length +
+      (off_t)lcd_fb_var_info.xoffset * sizeof(uint16_t);
+    if (lcd_fb_write_at(offset, row, row_bytes) < 0) {
+      return -1;
+    }
+    row += row_bytes;
+  }
+
+  return 0;
 }
 
 /************ LCD Device Interface *************/
@@ -281,19 +393,18 @@ static void lcd_device_init()
 }
 
 void lcd_clear_screen(void) {
-  const LcdFrame frame={{0}};
-  lcd_draw_frame(&frame);
+  static const LcdFrame frame={{0}};
+  const size_t size = LCD_DISPLAY_MAN == MIDAS
+    ? PXL_CNT_MIDAS * sizeof(uint16_t)
+    : PXL_CNT_SANTEK * sizeof(uint16_t);
+  lcd_draw_frame2(frame.data, size);
 }
 
 void lcd_draw_frame(const LcdFrame* frame) {
-   if (lcd_use_fb) {
-      lseek(lcd_fd, 0, SEEK_SET);
-      (void)write(lcd_fd, frame->data, sizeof(frame->data));
-   } else {
-      static const uint8_t WRITE_RAM = 0x2C;
-      lcd_spi_transfer(TRUE, 1, &WRITE_RAM);
-      lcd_spi_transfer(FALSE, sizeof(frame->data), frame->data);
-   }
+  const size_t size = LCD_DISPLAY_MAN == MIDAS
+    ? PXL_CNT_MIDAS * sizeof(uint16_t)
+    : PXL_CNT_SANTEK * sizeof(uint16_t);
+  lcd_draw_frame2(frame->data, size);
 }
 
 // Here we jsut crop the images cutting off top/bottom/and sides
@@ -322,34 +433,42 @@ void lcd_draw_frame2_midas_crop(const uint16_t* frame, size_t size)
 void lcd_draw_frame2_midas(const uint16_t* frame, size_t size) {
   static uint16_t buffer[LCD_FRAME_WIDTH_MIDAS * LCD_FRAME_HEIGHT_MIDAS];
 
+  if (lcd_use_fb) {
+    (void)lcd_fb_draw_frame(frame, LCD_FRAME_WIDTH_MIDAS, LCD_FRAME_HEIGHT_MIDAS);
+    return;
+  }
+
   for(int i=0; i < LCD_FRAME_WIDTH_MIDAS * LCD_FRAME_HEIGHT_MIDAS ; i++) {
     buffer[i] = __builtin_bswap16(frame[i]);
   }
-  
-  if (0) { // Does this work?
-    lseek(lcd_fd, 0, SEEK_SET);
-    (void)write(lcd_fd, buffer, size);
-  } else {
- 
-    static const uint8_t WRITE_RAM = 0x2C;
-    lcd_spi_transfer(TRUE, 1, &WRITE_RAM);
-    lcd_spi_transfer(FALSE, size, buffer);
+
+  static const uint8_t WRITE_RAM = 0x2C;
+  if (lcd_spi_transfer(TRUE, 1, &WRITE_RAM) == 0) {
+    (void)lcd_spi_transfer(FALSE, size, buffer);
   }
 }
 
 void lcd_draw_frame2_santek(const uint16_t* frame, size_t size) {
    if (lcd_use_fb) {
-      lseek(lcd_fd, 0, SEEK_SET);
-      (void)write(lcd_fd, frame, size);
+      (void)lcd_fb_draw_frame(frame, LCD_FRAME_WIDTH_SANTEK, LCD_FRAME_HEIGHT_SANTEK);
    } else {
    
       static const uint8_t WRITE_RAM = 0x2C;
-      lcd_spi_transfer(TRUE, 1, &WRITE_RAM);
-      lcd_spi_transfer(FALSE, size, frame);
+      if (lcd_spi_transfer(TRUE, 1, &WRITE_RAM) == 0) {
+        (void)lcd_spi_transfer(FALSE, size, frame);
+      }
    }
 }
 
 void lcd_draw_frame2(const uint16_t* frame, size_t size) {
+  const size_t expected_size = LCD_DISPLAY_MAN == MIDAS
+    ? PXL_CNT_MIDAS * sizeof(uint16_t)
+    : PXL_CNT_SANTEK * sizeof(uint16_t);
+  if (frame == NULL || size != expected_size) {
+    printf("Invalid LCD frame: expected %zu bytes, got %zu\n", expected_size, size);
+    return;
+  }
+
   if (LCD_DISPLAY_MAN != SANTEK) {
     lcd_draw_frame2_midas(frame, size);
   } else {
@@ -404,6 +523,7 @@ int lcd_set_brightness(int brightness)
 int lcd_init(void) {
 
   // define LCD manufacturer rather than read the EMR partition upon EVERY SINGLE LCD DRAW
+  lcd_use_fb = FALSE;
   InitIsXray();
   LCD_DISPLAY_MAN = lcd_display_version();
 
@@ -414,8 +534,9 @@ int lcd_init(void) {
   }
 
   lcd_fd = lcd_fb_init();
-  if (lcd_fd > 0) {
+  if (lcd_fd >= 0) {
     lcd_use_fb = TRUE;
+    lcd_clear_screen();
     return 0; // use framebuffer device
   }
 
