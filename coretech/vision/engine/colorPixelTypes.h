@@ -72,7 +72,7 @@ namespace Vision {
     PixelRGBA() : PixelRGBA(0,0,0,255) { }
     
     PixelRGBA(const PixelRGB& pixelRGB, u8 alpha = 255)
-    : PixelRGBA(pixelRGB.r(), pixelRGB.g(), pixelRGB.g(), alpha) { }
+    : PixelRGBA(pixelRGB.r(), pixelRGB.g(), pixelRGB.b(), alpha) { }
     
     // Const accessors
     u8  r() const { return this->operator[](0); }

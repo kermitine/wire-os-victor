@@ -15,6 +15,7 @@
 #include "coretech/vision/engine/observableObject.h"
 #include "coretech/vision/engine/perspectivePoseEstimation.h"
 #include "coretech/vision/engine/profiler.h"
+#include "coretech/vision/shared/compositeImage/compositeImage.h"
 
 using namespace Anki;
 
@@ -319,6 +320,12 @@ GTEST_TEST(ColorPixels, Accessors)
   ASSERT_EQ(245, q[2]);
   ASSERT_EQ(200, q[3]);
 
+  const PixelRGBA fromRGB(PixelRGB(23,11,45), 128);
+  ASSERT_EQ(23, fromRGB.r());
+  ASSERT_EQ(11, fromRGB.g());
+  ASSERT_EQ(45, fromRGB.b());
+  ASSERT_EQ(128, fromRGB.a());
+
 }
 
 GTEST_TEST(ColorPixels, GrayConverters)
@@ -342,9 +349,65 @@ GTEST_TEST(ColorPixels, GrayConverters)
   
 }
 
+GTEST_TEST(CompositeImage, AlphaBlend)
+{
+  using namespace Anki::Vision;
+
+  auto* sprite = new ImageRGBA(1, 2);
+  sprite->GetRow(0)[0] = PixelRGBA(255, 0, 0, 128);
+  sprite->GetRow(0)[1] = PixelRGBA(0, 255, 0, 0);
+
+  const auto spriteHandle = std::make_shared<SpriteWrapper>(sprite);
+  const SpriteBox spriteBox {
+    50.0f,
+    0,
+    0,
+    2,
+    1,
+    SpriteBoxName::SpriteBox_1,
+    LayerName::Layer_1,
+    SpriteRenderMethod::RGBA,
+    0
+  };
+
+  CompositeImage composite(nullptr);
+  composite.AddImage(spriteBox, spriteHandle);
+
+  ImageRGBA output(1, 2);
+  composite.DrawIntoImage(output);
+
+  EXPECT_EQ(64, output.GetRow(0)[0].r());
+  EXPECT_EQ(0, output.GetRow(0)[0].g());
+  EXPECT_EQ(0, output.GetRow(0)[0].b());
+  EXPECT_EQ(255, output.GetRow(0)[0].a());
+
+  EXPECT_EQ(0, output.GetRow(0)[1].r());
+  EXPECT_EQ(0, output.GetRow(0)[1].g());
+  EXPECT_EQ(0, output.GetRow(0)[1].b());
+  EXPECT_EQ(255, output.GetRow(0)[1].a());
+}
+
 GTEST_TEST(ColorPixels, RGB565Conversion)
 {
   using namespace Anki::Vision;
+
+  EXPECT_EQ(0xF800, PixelRGB565(255,   0, 0).GetValue());
+  EXPECT_EQ(0xFC00, PixelRGB565(255, 128, 0).GetValue());
+  EXPECT_EQ(0xFFE0, PixelRGB565(255, 255, 0).GetValue());
+
+  ImageRGB warmColors(2, 2);
+  warmColors.GetRow(0)[0] = PixelRGB(255,   0, 0);
+  warmColors.GetRow(0)[1] = PixelRGB(255, 128, 0);
+  warmColors.GetRow(1)[0] = PixelRGB(255, 128, 0);
+  warmColors.GetRow(1)[1] = PixelRGB(255, 255, 0);
+  ImageRGB565 resizedWarmColors(warmColors);
+  resizedWarmColors.Resize(3, 3);
+  for(s32 row = 0; row < resizedWarmColors.GetNumRows(); ++row) {
+    for(s32 col = 0; col < resizedWarmColors.GetNumCols(); ++col) {
+      EXPECT_EQ(248, resizedWarmColors.GetRow(row)[col].r());
+      EXPECT_EQ(0, resizedWarmColors.GetRow(row)[col].b());
+    }
+  }
   
   // RGB24 to RGB565
   const std::vector<u8> valuesRGB = {

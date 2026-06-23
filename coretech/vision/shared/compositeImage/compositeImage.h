@@ -63,11 +63,11 @@ public:
 
 
 private:
-  void DrawSpriteIntoImage(const Sprite& sprite, ImageRGBA& baseImage, const bool firstImage) const;
-  void DrawSpriteImage(const ImageRGBA& spriteImage, 
+  void DrawSpriteIntoImage(const Sprite& sprite, ImageRGBA& baseImage) const;
+  void DrawSpriteImage(const ImageRGBA& spriteImage,
                        ImageRGBA& baseImage,
                        const Point2f& topCorner,
-                       bool firstImage) const;
+                       float spriteAlpha) const;
 
   // To allow sprite boxes to be rendered the color of the robot's eyes
   // store references to the static face hue/saturation images internally

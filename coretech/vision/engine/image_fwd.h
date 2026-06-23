@@ -369,6 +369,11 @@ public:
   explicit ImageRGB565(const ImageRGB& imageRGB);
   explicit ImageRGB565(const ImageBase<PixelRGB565>& imageBase) : ImageBase<PixelRGB565>(imageBase) { }
   ImageRGB565(const Array2d<PixelRGB565>& array2d) : ImageBase<PixelRGB565>(array2d) { }
+
+  using ImageBase<PixelRGB565>::Resize;
+  // Packed RGB565 bytes cannot be interpolated independently. Resize in RGB
+  // space and repack so color bitfields remain intact.
+  void Resize(s32 desiredRows, s32 desiredCols, ResizeMethod method = ResizeMethod::Linear);
   
   ImageRGB565& SetFromImage(const Image& image);
   ImageRGB565& SetFromImageRGB(const ImageRGB& imageRGB);

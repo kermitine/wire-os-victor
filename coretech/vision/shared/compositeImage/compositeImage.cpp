@@ -19,6 +19,9 @@
 #include "util/cpuProfiler/cpuProfiler.h"
 #include "util/logging/logging.h"
 
+#include <algorithm>
+#include <cmath>
+
 #define LOG_CHANNEL "CompositeImage"
 
 namespace Anki {
@@ -83,20 +86,25 @@ void CompositeImage::DrawIntoImage(ImageRGBA& baseImage, const LayerName firstLa
     return;
   }
 
-  bool firstImage = true;
+  // The face display is opaque. Start with an opaque black canvas and use
+  // source-over compositing for every sprite placed on it.
+  baseImage.FillWith(Vision::PixelRGBA());
+
   for(const auto& layerPair : _layerMap){
     if(layerPair.first < firstLayer){
       continue;
     }
+    if(layerPair.first > lastLayer){
+      break;
+    }
     for(const auto& sprite : layerPair.second){
-      DrawSpriteIntoImage(sprite, baseImage, firstImage);
-      firstImage = false;
+      DrawSpriteIntoImage(sprite, baseImage);
     }
   }
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-void CompositeImage::DrawSpriteIntoImage(const Sprite& sprite, ImageRGBA& baseImage, const bool firstImage) const
+void CompositeImage::DrawSpriteIntoImage(const Sprite& sprite, ImageRGBA& baseImage) const
 {
   Point2f topCorner = {static_cast<float>(sprite.spriteBox.xPos), static_cast<float>(sprite.spriteBox.yPos)};
 
@@ -106,10 +114,10 @@ void CompositeImage::DrawSpriteIntoImage(const Sprite& sprite, ImageRGBA& baseIm
       // Check to see if the RGBA image is cached
       if(sprite.spriteHandle->IsContentCached().rgba){
         const ImageRGBA& spriteImage = sprite.spriteHandle->GetCachedSpriteContentsRGBA();
-        DrawSpriteImage(spriteImage, baseImage, topCorner, firstImage);
+        DrawSpriteImage(spriteImage, baseImage, topCorner, sprite.spriteBox.alpha);
       }else{
         const ImageRGBA& spriteImage = sprite.spriteHandle->GetSpriteContentsRGBA();
-        DrawSpriteImage(spriteImage, baseImage, topCorner, firstImage);
+        DrawSpriteImage(spriteImage, baseImage, topCorner, sprite.spriteBox.alpha);
       }
       break;
     }
@@ -135,10 +143,10 @@ void CompositeImage::DrawSpriteIntoImage(const Sprite& sprite, ImageRGBA& baseIm
       // Render the sprite - use the cached RGBA image if possible
       if(sprite.spriteHandle->IsContentCached(hsImageHandle).rgba){
         const ImageRGBA& spriteImage = sprite.spriteHandle->GetCachedSpriteContentsRGBA(hsImageHandle);
-        DrawSpriteImage(spriteImage, baseImage, topCorner, firstImage);
+        DrawSpriteImage(spriteImage, baseImage, topCorner, sprite.spriteBox.alpha);
       }else{
         const ImageRGBA& spriteImage = sprite.spriteHandle->GetSpriteContentsRGBA(hsImageHandle);
-        DrawSpriteImage(spriteImage, baseImage, topCorner, firstImage);
+        DrawSpriteImage(spriteImage, baseImage, topCorner, sprite.spriteBox.alpha);
       }
       break;
     }
@@ -156,21 +164,46 @@ void CompositeImage::DrawSpriteIntoImage(const Sprite& sprite, ImageRGBA& baseIm
 void CompositeImage::DrawSpriteImage(const ImageRGBA& spriteImage,
                                      ImageRGBA& baseImage,
                                      const Point2f& topCorner,
-                                     bool firstImage) const
+                                     float spriteAlpha) const
 {
-  // if the first layer rendered is going to be full-screen and draw all pixels, then there's
-  // no need to clear the buffer (with FillWith) since all of those blank pixels will be
-  // immediately overwritten. This saves about 1/5 ms when those conditions are true.
-  if( firstImage &&
-      ( (spriteImage.GetNumRows() != baseImage.GetNumRows()) ||
-        (spriteImage.GetNumCols() != baseImage.GetNumCols()) ) ){
-    ANKI_CPU_PROFILE("img->FillWith"); // This takes roughly 0.205 ms on robot.
-    baseImage.FillWith(Vision::PixelRGBA());
+  const float spriteAlphaScale = std::max(0.0f, std::min(100.0f, spriteAlpha)) / 100.0f;
+  if(spriteAlphaScale <= 0.0f) {
+    return;
   }
 
-  // Always use the faster 'draw blank pixels' rendering on the first
-  // image, since it's always drawn over the initial blank image
-  baseImage.DrawSubImage(spriteImage, topCorner, firstImage);
+  const s32 destLeft = std::max(0, static_cast<s32>(topCorner.x()));
+  const s32 destTop = std::max(0, static_cast<s32>(topCorner.y()));
+  const s32 destRight = std::min(baseImage.GetNumCols(),
+                                 static_cast<s32>(topCorner.x()) + spriteImage.GetNumCols());
+  const s32 destBottom = std::min(baseImage.GetNumRows(),
+                                  static_cast<s32>(topCorner.y()) + spriteImage.GetNumRows());
+  const s32 srcLeft = destLeft - static_cast<s32>(topCorner.x());
+  const s32 srcTop = destTop - static_cast<s32>(topCorner.y());
+
+  for(s32 y = destTop; y < destBottom; ++y) {
+    const PixelRGBA* src = spriteImage.GetRow(srcTop + y - destTop) + srcLeft;
+    PixelRGBA* dst = baseImage.GetRow(y) + destLeft;
+
+    for(s32 x = destLeft; x < destRight; ++x, ++src, ++dst) {
+      const u32 alpha = static_cast<u32>(std::round(src->a() * spriteAlphaScale));
+      if(alpha == 0) {
+        continue;
+      }
+      if(alpha >= 255) {
+        dst->r() = src->r();
+        dst->g() = src->g();
+        dst->b() = src->b();
+        dst->a() = 255;
+        continue;
+      }
+
+      const u32 invAlpha = 255 - alpha;
+      dst->r() = static_cast<u8>((src->r() * alpha + dst->r() * invAlpha + 127) / 255);
+      dst->g() = static_cast<u8>((src->g() * alpha + dst->g() * invAlpha + 127) / 255);
+      dst->b() = static_cast<u8>((src->b() * alpha + dst->b() * invAlpha + 127) / 255);
+      dst->a() = 255;
+    }
+  }
 }
 
 } // namespace Vision

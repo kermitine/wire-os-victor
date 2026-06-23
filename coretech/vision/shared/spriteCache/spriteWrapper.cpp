@@ -19,8 +19,66 @@
 #include "util/helpers/templateHelpers.h"
 #include "anki/cozmo/shared/cozmoConfig.h"
 
+#include "opencv2/imgcodecs.hpp"
+
+#include <algorithm>
+
 namespace Anki {
 namespace Vision {
+
+namespace {
+
+void MakeBlackTransparent(ImageRGBA& image)
+{
+  const s32 numRows = image.GetNumRows();
+  const s32 numCols = image.GetNumCols();
+  for(s32 row = 0; row < numRows; ++row) {
+    PixelRGBA* pixels = image.GetRow(row);
+    for(s32 col = 0; col < numCols; ++col) {
+      PixelRGBA& pixel = pixels[col];
+      if(pixel.r() == 0 && pixel.g() == 0 && pixel.b() == 0 && pixel.a() == 255) {
+        pixel.a() = 0;
+      }
+    }
+  }
+}
+
+void ResizeWithPremultipliedAlpha(ImageRGBA& image, s32 desiredRows, s32 desiredCols)
+{
+  if(image.GetNumRows() == desiredRows && image.GetNumCols() == desiredCols) {
+    return;
+  }
+
+  for(s32 row = 0; row < image.GetNumRows(); ++row) {
+    PixelRGBA* pixels = image.GetRow(row);
+    for(s32 col = 0; col < image.GetNumCols(); ++col) {
+      PixelRGBA& pixel = pixels[col];
+      const u32 alpha = pixel.a();
+      pixel.r() = static_cast<u8>((pixel.r() * alpha + 127) / 255);
+      pixel.g() = static_cast<u8>((pixel.g() * alpha + 127) / 255);
+      pixel.b() = static_cast<u8>((pixel.b() * alpha + 127) / 255);
+    }
+  }
+
+  image.Resize(desiredRows, desiredCols, ResizeMethod::Linear);
+
+  for(s32 row = 0; row < image.GetNumRows(); ++row) {
+    PixelRGBA* pixels = image.GetRow(row);
+    for(s32 col = 0; col < image.GetNumCols(); ++col) {
+      PixelRGBA& pixel = pixels[col];
+      const u32 alpha = pixel.a();
+      if(alpha == 0) {
+        pixel.r() = pixel.g() = pixel.b() = 0;
+      } else {
+        pixel.r() = static_cast<u8>(std::min<u32>(255, (pixel.r() * 255 + alpha / 2) / alpha));
+        pixel.g() = static_cast<u8>(std::min<u32>(255, (pixel.g() * 255 + alpha / 2) / alpha));
+        pixel.b() = static_cast<u8>(std::min<u32>(255, (pixel.b() * 255 + alpha / 2) / alpha));
+      }
+    }
+  }
+}
+
+} // anonymous namespace
 
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -33,6 +91,9 @@ SpriteWrapper::SpriteWrapper(const std::string& fullSpritePath)
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 SpriteWrapper::SpriteWrapper(ImageRGBA* sprite)
 {
+  if(sprite != nullptr) {
+    MakeBlackTransparent(*sprite);
+  }
   _spriteRGBA.reset(sprite);
 }
 
@@ -266,15 +327,40 @@ void SpriteWrapper::LoadSprite(ImageRGBA* outImage, const HSImageHandle& hsImage
     outImage->Allocate(grayImg.GetNumRows(), grayImg.GetNumCols());
     ApplyHS(grayImg, hsImage, outImage);
   }else{
-    // Load the image in as an RGB directly
-    auto res = outImage->Load(_fullSpritePath.c_str());
-    ANKI_VERIFY(RESULT_OK == res,
-                "CompositeImage.SpriteBoxImpl.Constructor.ColorLoadFailed",
-                "Failed to load sprite %s",
-                _fullSpritePath.c_str());
+    // Preserve a PNG's alpha channel when present. Legacy three-channel
+    // sprites use exact black as their transparent color.
+    cv::Mat showableImage;
+    try {
+      showableImage = cv::imread(_fullSpritePath.c_str(), cv::IMREAD_UNCHANGED);
+    }
+    catch(const cv::Exception& e) {
+      PRINT_NAMED_ERROR("CompositeImage.SpriteBoxImpl.Constructor.ColorLoadFailed",
+                        "Failed to load sprite %s: %s",
+                        _fullSpritePath.c_str(), e.what());
+      return;
+    }
+
+    if(showableImage.empty() ||
+       (showableImage.channels() != 1 && showableImage.channels() != 3 && showableImage.channels() != 4)) {
+      PRINT_NAMED_ERROR("CompositeImage.SpriteBoxImpl.Constructor.ColorLoadFailed",
+                        "Sprite %s must contain one, three, or four channels",
+                        _fullSpritePath.c_str());
+      return;
+    }
+
+    if(showableImage.channels() == 1) {
+      cv::Mat showableRGBA;
+      cv::cvtColor(showableImage, showableRGBA, cv::COLOR_GRAY2BGRA);
+      outImage->SetFromShowableFormat(showableRGBA);
+    } else {
+      outImage->SetFromShowableFormat(showableImage);
+    }
+    MakeBlackTransparent(*outImage);
   }
   if(Vector::IsXray()) {
-    outImage->Resize(outImage->GetNumRows() * 80 / 96, outImage->GetNumCols() * 160 / 184);
+    ResizeWithPremultipliedAlpha(*outImage,
+                                 outImage->GetNumRows() * 80 / 96,
+                                 outImage->GetNumCols() * 160 / 184);
   }
 }
 
@@ -330,6 +416,7 @@ void SpriteWrapper::ApplyHS(const Image& grayImg, const HSImageHandle& hsImage, 
   imageHSV.ConvertHSV2RGB565(im565);
 
   outImg->SetFromRGB565(im565);
+  MakeBlackTransparent(*outImg);
 
   if(memoryAllocated){
     Util::SafeDelete(hueImage);

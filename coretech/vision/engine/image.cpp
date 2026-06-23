@@ -1724,8 +1724,13 @@ namespace Vision {
   }
 
   void ImageRGBA::SetFromShowableFormat(const cv::Mat& showImg) {
-    DEV_ASSERT(showImg.channels() == 3, "ImageRGBA.SetFromShowableFormat.UnexpectedNumChannels");
-    cv::cvtColor(showImg, this->get_CvMat_(), cv::COLOR_BGR2RGBA);
+    DEV_ASSERT(showImg.channels() == 3 || showImg.channels() == 4,
+               "ImageRGBA.SetFromShowableFormat.UnexpectedNumChannels");
+    if(showImg.channels() == 4) {
+      cv::cvtColor(showImg, this->get_CvMat_(), cv::COLOR_BGRA2RGBA);
+    } else {
+      cv::cvtColor(showImg, this->get_CvMat_(), cv::COLOR_BGR2RGBA);
+    }
   }
 
 #if 0
@@ -2025,6 +2030,17 @@ namespace Vision {
     SetFromVector( pixels );
   }
 
+  void ImageRGB565::Resize(s32 desiredRows, s32 desiredCols, ResizeMethod method)
+  {
+    if(desiredRows == GetNumRows() && desiredCols == GetNumCols()) {
+      return;
+    }
+
+    ImageRGB unpacked(*this);
+    unpacked.Resize(desiredRows, desiredCols, method);
+    SetFromImageRGB(unpacked);
+  }
+
   ImageRGB565& ImageRGB565::SetFromImage(const Image& image)
   {
     Allocate(image.GetNumRows(), image.GetNumCols());
@@ -2043,9 +2059,15 @@ namespace Vision {
   ImageRGB565& ImageRGB565::SetFromImageRGB(const ImageRGB& imageRGB)
   {
     ANKI_CPU_PROFILE("ImageRGB565::SetFromImageRGB");
-    // Similar to how COLOR_BGR5652BGR appears to be swapping R and B in ConvertToShowableFormat(),
-    // COLOR_RGB2BGR565 here appears not to, which is what we want.
-    cv::cvtColor(imageRGB.get_CvMat_(), this->get_CvMat_(), cv::COLOR_RGB2BGR565);
+    Allocate(imageRGB.GetNumRows(), imageRGB.GetNumCols());
+
+    // Pack explicitly instead of depending on OpenCV's historically confusing
+    // BGR565 conversion semantics. PixelRGB565 always stores R5:G6:B5.
+    std::function<PixelRGB565(const PixelRGB&)> convertFcn = [](const PixelRGB& pixel)
+    {
+      return PixelRGB565(pixel.r(), pixel.g(), pixel.b());
+    };
+    imageRGB.ApplyScalarFunction(convertFcn, *this);
     return *this;
   }
 
